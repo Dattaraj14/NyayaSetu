@@ -1,0 +1,64 @@
+# ============================================================
+# NyayaSetu Backend Dependencies
+# ============================================================
+
+# Web Framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.20
+pydantic==2.10.5
+pydantic-settings==2.7.1
+
+# Database
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+psycopg2-binary==2.9.10
+alembic==1.14.1
+greenlet==3.1.1
+
+# PDF Processing
+PyMuPDF==1.25.3
+
+# OCR
+paddlepaddle==3.0.0
+paddleocr==2.10.0
+pytesseract==0.3.13
+Pillow==11.1.0
+
+# ML/AI
+torch==2.6.0
+sentence-transformers==4.1.0
+transformers==4.48.3
+faiss-cpu==1.9.0.post1
+
+# LLM
+
+google-genai==1.14.0
+
+# NLP
+spacy
+langdetect==1.0.9
+
+# Evaluation
+rouge-score==0.1.2
+bert-score==0.3.13
+nltk==3.9.1
+
+# Utilities
+python-dotenv==1.0.1
+aiofiles==24.1.0
+httpx==0.28.1
+tenacity==9.0.0
+structlog==25.1.0
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt==4.2.1
+
+# Testing
+pytest==8.3.4
+pytest-asyncio==0.25.3
+pytest-cov==6.0.0
+httpx==0.28.1
+
+# Code Quality
+ruff==0.9.7
