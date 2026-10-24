@@ -1,32 +1,55 @@
-# React + TypeScript + Vite
+# NyayaSetu Frontend
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+The NyayaSetu frontend is a React and TypeScript single-page application built with Vite. It provides an interface for uploading a legal PDF, following its processing status, choosing a response language, and asking questions about the document.
 
-Currently, two official plugins are available:
+## Features
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- PDF selection and a 50 MB client-side size check.
+- Upload and processing status display.
+- Automatic request to build a semantic search index after document processing.
+- Document question and answer chat.
+- English, Hindi, and Marathi response-language selection.
+- Markdown rendering for assistant answers.
 
-## React Compiler
+The frontend supports document-grounded chat. The backend's general legal mode is not implemented.
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## Requirements
 
-## Expanding the Oxlint configuration
+- Node.js and npm.
+- The NyayaSetu backend running at `http://127.0.0.1:8000`.
 
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
+## Run locally
 
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+From the frontend directory:
+
+```powershell
+npm install
+npm run dev
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+Vite prints the local development URL, usually `http://localhost:5173`.
+
+## Available scripts
+
+| Command | Purpose |
+| --- | --- |
+| `npm run dev` | Start the Vite development server |
+| `npm run build` | Type-check and build the production frontend |
+| `npm run lint` | Run Oxlint |
+| `npm run preview` | Preview the production build |
+
+## Backend connection
+
+The API base URL is currently set directly in `src/App.tsx`:
+
+```ts
+const API_BASE = 'http://127.0.0.1:8000/api'
+```
+
+The backend must allow the frontend origin through its `ALLOWED_ORIGINS` configuration.
+
+## Current integration notes
+
+- The frontend reads processing progress from `progress`, while the backend document response uses `processing_progress`.
+- The frontend source display expects fields such as `page_number` and `section_type`; the chat response currently returns `page` and `section`. Source entries may therefore show without page or section details.
+- The chat response uses a `message` field. The frontend supports that field, with `answer` as a fallback.
