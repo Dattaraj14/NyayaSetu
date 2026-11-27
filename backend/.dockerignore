@@ -1,0 +1,10 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.env
+nyayasetu.db
+uploads/
+temp/
+data/
+tests/
