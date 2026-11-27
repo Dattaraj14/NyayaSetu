@@ -1,13 +1,14 @@
 """Document-related Pydantic schemas."""
-from typing import Optional, Any, Literal
+
 from datetime import datetime
-from typing import Optional, Any
+from typing import Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, Field
 
 
 # ─── Document Schemas ────────────────────────────────────────
+
 
 class DocumentUploadResponse(BaseModel):
     id: UUID
@@ -98,6 +99,7 @@ class DocumentStatusResponse(BaseModel):
 
 # ─── Summary Schemas ─────────────────────────────────────────
 
+
 class SummarizeRequest(BaseModel):
     summary_type: str = Field(..., pattern="^(short|medium|detailed)$")
     language: str = Field(default="en", pattern="^(en|hi|mr)$")
@@ -118,6 +120,7 @@ class SummaryResponse(BaseModel):
 
 # ─── Simplification Schemas ──────────────────────────────────
 
+
 class SimplifyRequest(BaseModel):
     language: str = Field(default="en", pattern="^(en|hi|mr)$")
 
@@ -133,9 +136,13 @@ class SimplificationResponse(BaseModel):
 
 # ─── Translation Schemas ─────────────────────────────────────
 
+
 class TranslateRequest(BaseModel):
     target_language: str = Field(..., pattern="^(hi|mr)$")
-    content_type: str = Field(default="summary_medium", pattern="^(summary_short|summary_medium|summary_detailed|simplification)$")
+    content_type: str = Field(
+        default="summary_medium",
+        pattern="^(summary_short|summary_medium|summary_detailed|simplification)$",
+    )
 
 
 class TranslationResponse(BaseModel):
@@ -153,24 +160,19 @@ class TranslationResponse(BaseModel):
 
 # ─── Chat Schemas ────────────────────────────────────────────
 
+
 class ChatRequest(BaseModel):
     message: str = Field(
         ...,
         min_length=1,
         max_length=2000,
     )
-
     session_id: Optional[UUID] = None
-
     language: str = Field(
         default="en",
         pattern="^(en|hi|mr)$",
     )
-
-    mode: Literal[
-        "document_qa",
-        "general_legal",
-    ] = "document_qa"
+    mode: Literal["document_qa", "general_legal"] = "document_qa"
 
 
 class SourceReference(BaseModel):
@@ -182,6 +184,14 @@ class SourceReference(BaseModel):
     knowledge_source: Optional[str] = None
 
 
+class VerifiedClaim(BaseModel):
+    text: str
+    source_ids: list[str] = []
+    chunk_ids: list[str] = []
+    pages: list[int] = []
+    supported: bool = True
+
+
 class ChatResponse(BaseModel):
     session_id: UUID
     message: str
@@ -190,10 +200,17 @@ class ChatResponse(BaseModel):
     was_refused: bool = False
     refusal_reason: Optional[str] = None
     mode: str  # document_qa or general_legal
-    disclaimer: str = "This is informational assistance and not a substitute for professional legal advice."
+    intent: Optional[str] = None
+    verification_status: Optional[str] = None
+    claims: list[VerifiedClaim] = []
+    trace: list[str] = []
+    disclaimer: str = (
+        "This is informational assistance and not a substitute for professional legal advice."
+    )
 
 
 # ─── Legal Search Schemas ────────────────────────────────────
+
 
 class LegalSearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=500)
@@ -215,6 +232,7 @@ class LegalSearchResponse(BaseModel):
 
 
 # ─── Health Schema ───────────────────────────────────────────
+
 
 class HealthResponse(BaseModel):
     status: str = "healthy"
