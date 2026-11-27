@@ -1,94 +1,25 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-*.egg-info/
-dist/
-build/
-.eggs/
+﻿# Secrets & environment
+.env
+backend/.env
+frontend/.env
+frontend/.env.local
+
+# Python & virtual environments
 venv/
 .venv/
-env/
-
-# Environment
-.env
-.env.local
-.env.production
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Node
-node_modules/
-frontend/node_modules/
-frontend/dist/
-
-# Models (too large for git)
-models/*.bin
-models/*.gguf
-models/*.safetensors
-models/*.pt
-models/*.pth
-
-# Data
-data/raw/*
-data/processed/*
-data/evaluation/*
-!data/raw/.gitkeep
-!data/processed/.gitkeep
-!data/evaluation/.gitkeep
-
-# FAISS indexes
-*.faiss
-*.index
-
-# Uploads
-uploads/
-temp/
-
-# Logs
-*.log
-logs/
-
-# PostgreSQL
-*.sql.bak
-
-# Docker volumes
-docker/data/
-
-# Coverage
-htmlcov/
-.coverage
-coverage.xml
-
-# pytest
+__pycache__/
+*.pyc
 .pytest_cache/
+.ruff_cache/
 
-# mypy
-.mypy_cache/
-
-# All local environment files (keep the example template)
-.env.*
-!.env.example
-
-# Local databases
-*.db
+# Local runtime data & databases
+backend/nyayasetu.db
+backend/data/
+backend/uploads/
+backend/temp/
 *.sqlite
 *.sqlite3
 
-# Frontend package-manager logs
-npm-debug.log*
-yarn-debug.log*
-pnpm-debug.log*
-
-# Generated vector index data
-backend/data/vector_indexes/
-
+# Frontend build & dependencies
+frontend/node_modules/
+frontend/dist/
