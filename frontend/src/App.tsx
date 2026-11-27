@@ -1,843 +1,1290 @@
-import { useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ChangeEvent, FormEvent } from 'react'
-import axios from 'axios'
 import ReactMarkdown from 'react-markdown'
 import {
-  FileText,
-  Upload,
-  Send,
-  Loader2,
-  CheckCircle2,
   AlertCircle,
   BookOpen,
-  MessageSquare,
-  Languages,
+  CheckCircle2,
+  Database,
+  Download,
+  FileText,
+  Loader2,
+  RefreshCw,
+  Scale,
+  Send,
+  ShieldAlert,
+  ShieldCheck,
+  Trash2,
+  Upload,
   X,
 } from 'lucide-react'
+import {
+  deleteDocument,
+  generateSummary,
+  getDocument,
+  getSummaryExportUrl,
+  indexDocument,
+  listDocuments,
+  listSummaries,
+  streamDocumentChat,
+  uploadDocument,
+} from './api'
+import type {
+  DocumentDetail,
+  DocumentListItem,
+  LanguageCode,
+  OcrLanguageCode,
+  SourceReference,
+  SummaryLength,
+  SummaryRecord,
+  VerifiedClaim,
+} from './api'
 import './App.css'
 
-const API_BASE = 'http://127.0.0.1:8000/api'
+type WorkspaceTab = 'qa' | 'brief'
 
-type ChatMessage = {
+interface ChatTurn {
+  id: string
   role: 'user' | 'assistant'
   content: string
+  intent?: string | null
+  verificationStatus?: string | null
+  wasRefused?: boolean
+  sources?: SourceReference[]
+  claims?: VerifiedClaim[]
+  trace?: string[]
+  isStreaming?: boolean
 }
 
-type Source = {
-  chunk_id?: string
-  page_number?: number
-  section_type?: string
-  score?: number
-}
+const QA_PIPELINE_NODES = [
+  { key: 'router', label: 'routing' },
+  { key: 'analyze_query', label: 'analyzing' },
+  { key: 'retrieve', label: 'retrieving' },
+  { key: 'rerank', label: 'reranking' },
+  { key: 'grade_evidence', label: 'grading' },
+  { key: 'generate', label: 'generating' },
+  { key: 'verify', label: 'verifying' },
+  { key: 'finalize', label: 'finalizing' },
+] as const
 
-type DocumentStatus =
-  | 'uploaded'
-  | 'validating'
-  | 'extracting'
-  | 'ocr_processing'
-  | 'preprocessing'
-  | 'analyzing'
-  | 'embedding'
-  | 'summarizing'
-  | 'completed'
-  | 'failed'
-
-const languageCodeMap: Record<string, string> = {
-  English: 'en',
-  Hindi: 'hi',
-  Marathi: 'mr',
-}
+const SUGGESTED_QUESTIONS = [
+  'Who are the parties and what is the core dispute?',
+  'What statutes or sections are cited in this document?',
+  'What was the final order or operative decision?',
+]
 
 function App() {
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const qaEndRef = useRef<HTMLDivElement>(null)
 
-  const [selectedFile, setSelectedFile] = useState<File | null>(null)
-  const [documentId, setDocumentId] = useState<string | null>(null)
+  const [activeTab, setActiveTab] = useState<WorkspaceTab>('qa')
+  const [language, setLanguage] = useState<LanguageCode>('en')
+  const [backendOnline, setBackendOnline] = useState(true)
 
-  // One chat session for the current browser session.
-  const [sessionId, setSessionId] = useState<string>(() =>
-    crypto.randomUUID(),
-  )
+  // Dossiers state
+  const [documents, setDocuments] = useState<DocumentListItem[]>([])
+  const [selectedDocId, setSelectedDocId] = useState<string | null>(null)
+  const [selectedDoc, setSelectedDoc] = useState<DocumentDetail | null>(null)
 
-  const [status, setStatus] = useState<DocumentStatus | null>(null)
-  const [statusMessage, setStatusMessage] = useState('')
-  const [progress, setProgress] = useState(0)
-
+  // Upload & processing state
+  const [stagedFile, setStagedFile] = useState<File | null>(null)
+  const [ocrLanguage, setOcrLanguage] = useState<OcrLanguageCode>('eng')
   const [uploading, setUploading] = useState(false)
   const [indexing, setIndexing] = useState(false)
+  const [progress, setProgress] = useState(0)
+  const [statusNote, setStatusNote] = useState('')
+  const [globalError, setGlobalError] = useState('')
+  const [needsIndexHint, setNeedsIndexHint] = useState(false)
 
+  // Q&A + SSE LangGraph state
+  const [sessionId, setSessionId] = useState<string>(() => crypto.randomUUID())
   const [question, setQuestion] = useState('')
-  const [language, setLanguage] = useState('English')
-
-  const [messages, setMessages] = useState<ChatMessage[]>([])
-  const [sources, setSources] = useState<Source[]>([])
-
+  const [turns, setTurns] = useState<ChatTurn[]>([])
   const [chatLoading, setChatLoading] = useState(false)
-  const [error, setError] = useState('')
+  const [activeNode, setActiveNode] = useState<string | null>(null)
+  const [completedNodes, setCompletedNodes] = useState<string[]>([])
 
-  const isProcessing =
-    uploading ||
-    indexing ||
-    (status !== null &&
-      status !== 'completed' &&
-      status !== 'failed')
+  // Evidence Inspector state
+  const [inspectedSources, setInspectedSources] = useState<SourceReference[]>([])
+  const [inspectedClaims, setInspectedClaims] = useState<VerifiedClaim[]>([])
+  const [activeSourceIndex, setActiveSourceIndex] = useState(0)
 
-  const handleFileSelect = (
-    event: ChangeEvent<HTMLInputElement>,
-  ) => {
+  // Structured Brief (LangGraph Summary) state
+  const [summaryType, setSummaryType] = useState<SummaryLength>('medium')
+  const [summaryLoading, setSummaryLoading] = useState(false)
+  const [activeSummary, setActiveSummary] = useState<SummaryRecord | null>(null)
+
+  const refreshDocuments = useCallback(async (selectId?: string) => {
+    try {
+      const docs = await listDocuments()
+      setBackendOnline(true)
+      setDocuments(docs)
+      if (selectId) {
+        setSelectedDocId(selectId)
+      } else {
+        setSelectedDocId((prev) => {
+          if (prev && docs.some((d) => d.id === prev)) return prev
+          return docs[0]?.id ?? null
+        })
+      }
+    } catch {
+      setBackendOnline(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void refreshDocuments()
+  }, [refreshDocuments])
+
+  // Load selected document detail & existing summaries whenever selection changes
+  useEffect(() => {
+    if (!selectedDocId) {
+      setSelectedDoc(null)
+      setActiveSummary(null)
+      return
+    }
+
+    let cancelled = false
+    const loadDetail = async () => {
+      try {
+        const [detail, existingSummaries] = await Promise.all([
+          getDocument(selectedDocId),
+          listSummaries(selectedDocId).catch(() => [] as SummaryRecord[]),
+        ])
+        if (cancelled) return
+        setSelectedDoc(detail)
+        setProgress(Math.round(detail.processing_progress || 0))
+        setStatusNote(detail.status_message || '')
+        const matched =
+          existingSummaries.find(
+            (s) => s.summary_type === summaryType && s.language === language,
+          ) || existingSummaries[0] || null
+        setActiveSummary(matched)
+      } catch (err) {
+        if (!cancelled && err instanceof Error) {
+          setGlobalError(err.message)
+        }
+      }
+    }
+
+    void loadDetail()
+    return () => {
+      cancelled = true
+    }
+  }, [selectedDocId, summaryType, language])
+
+  useEffect(() => {
+    qaEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [turns, chatLoading])
+
+  const handleSelectDossier = (docId: string) => {
+    if (docId === selectedDocId) return
+    setSelectedDocId(docId)
+    setTurns([])
+    setInspectedSources([])
+    setInspectedClaims([])
+    setActiveSourceIndex(0)
+    setActiveNode(null)
+    setCompletedNodes([])
+    setSessionId(crypto.randomUUID())
+    setGlobalError('')
+    setNeedsIndexHint(false)
+  }
+
+  const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
-
     if (!file) return
-
-    setError('')
-    setSelectedFile(null)
-
+    setGlobalError('')
     if (
       file.type !== 'application/pdf' &&
       !file.name.toLowerCase().endsWith('.pdf')
     ) {
-      setError('Please select a PDF file.')
+      setGlobalError('Please select a PDF document.')
       return
     }
-
-    const maxSize = 50 * 1024 * 1024
-
-    if (file.size > maxSize) {
-      setError('PDF size must be 50 MB or less.')
+    if (file.size > 50 * 1024 * 1024) {
+      setGlobalError('PDF file size must be 50 MB or less.')
       return
     }
-
-    setSelectedFile(file)
+    setStagedFile(file)
   }
 
-  const resetDocument = () => {
-    setSelectedFile(null)
-    setDocumentId(null)
-    setStatus(null)
-    setStatusMessage('')
-    setProgress(0)
-    setMessages([])
-    setSources([])
-    setError('')
-    setSessionId(crypto.randomUUID())
-
-    if (fileInputRef.current) {
-      fileInputRef.current.value = ''
-    }
-  }
-
-  const uploadDocument = async () => {
-    if (!selectedFile) {
-      setError('Please select a PDF first.')
-      return
-    }
-
-    setUploading(true)
-    setError('')
-    setMessages([])
-    setSources([])
-    setDocumentId(null)
-    setStatus('uploaded')
-    setProgress(5)
-    setStatusMessage('Uploading document...')
-    setSessionId(crypto.randomUUID())
-
-    try {
-      const formData = new FormData()
-      formData.append('file', selectedFile)
-
-      const response = await axios.post(
-        `${API_BASE}/documents/upload`,
-        formData,
-        {
-          headers: {
-            'Content-Type': 'multipart/form-data',
-          },
-        },
-      )
-
-      // Backend returns "id", not "document_id".
-      const id = response.data.id
-
-      if (!id) {
-        throw new Error(
-          'Backend did not return a document ID.',
-        )
-      }
-
-      setDocumentId(id)
-      setStatus(response.data.status || 'uploaded')
-      setStatusMessage(
-        response.data.message ||
-          'Document uploaded successfully.',
-      )
-      setProgress(10)
-
-      await pollDocumentStatus(id)
-    } catch (err) {
-      console.error(err)
-
-      if (axios.isAxiosError(err)) {
-        setError(
-          err.response?.data?.detail ||
-            'Failed to upload the document. Make sure the backend is running.',
-        )
-      } else if (err instanceof Error) {
-        setError(err.message)
-      } else {
-        setError('An unexpected error occurred during upload.')
-      }
-
-      setStatus('failed')
-    } finally {
-      setUploading(false)
-    }
-  }
-
-  const pollDocumentStatus = async (id: string) => {
-    const maxAttempts = 180
-
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      try {
-        const response = await axios.get(
-          `${API_BASE}/documents/${id}`,
-        )
-
-        const document = response.data
-
-        setStatus(document.status)
-        setStatusMessage(
-          document.status_message ||
-            'Processing document...',
-        )
-
-        if (typeof document.progress === 'number') {
-          setProgress(document.progress)
-        }
-
-        if (document.status === 'completed') {
-          setProgress(90)
-          setStatusMessage(
-            'Document processing completed. Building semantic search index...',
-          )
-
-          await buildIndex(id)
-          return
-        }
-
-        if (document.status === 'failed') {
-          setError(
-            document.status_message ||
-              'Document processing failed.',
-          )
-          return
-        }
-      } catch (err) {
-        console.error(
-          'Document status polling error:',
-          err,
-        )
-      }
-
-      await new Promise((resolve) =>
-        setTimeout(resolve, 2000),
-      )
-    }
-
-    setError(
-      'Document processing is taking longer than expected.',
-    )
-    setStatus('failed')
-  }
-
-  const buildIndex = async (id: string) => {
+  const handleBuildIndex = async (docId: string) => {
     setIndexing(true)
-    setStatus('embedding')
+    setNeedsIndexHint(false)
+    setGlobalError('')
     setProgress(95)
-    setStatusMessage(
-      'Building semantic search index...',
-    )
-
+    setStatusNote('Building semantic + BM25 search index...')
     try {
-      const response = await axios.post(
-        `${API_BASE}/documents/${id}/index`,
-      )
-
-      setStatus('completed')
+      const res = await indexDocument(docId)
       setProgress(100)
-      setStatusMessage(
-        response.data.message ||
-          'Document is ready for questions.',
-      )
+      setStatusNote(res.message)
+      const detail = await getDocument(docId)
+      setSelectedDoc(detail)
+      await refreshDocuments(docId)
     } catch (err) {
-      console.error(err)
-
-      if (axios.isAxiosError(err)) {
-        setError(
-          err.response?.data?.detail ||
-            'Failed to build the semantic search index.',
-        )
-      } else {
-        setError(
-          'Failed to build the semantic search index.',
-        )
-      }
-
-      setStatus('failed')
+      setGlobalError(
+        err instanceof Error ? err.message : 'Failed to build search index.',
+      )
     } finally {
       setIndexing(false)
     }
   }
 
-  const handleSubmit = async (event: FormEvent) => {
-    event.preventDefault()
+  const pollUntilComplete = async (docId: string) => {
+    for (let attempt = 0; attempt < 180; attempt += 1) {
+      const detail = await getDocument(docId)
+      setSelectedDoc(detail)
+      setProgress(Math.round(detail.processing_progress || 0))
+      setStatusNote(detail.status_message || 'Processing document...')
 
-    const userQuestion = question.trim()
+      if (detail.status === 'completed') {
+        await handleBuildIndex(docId)
+        return
+      }
+      if (detail.status === 'failed') {
+        setGlobalError(detail.status_message || 'Document processing failed.')
+        await refreshDocuments(docId)
+        return
+      }
 
-    if (!userQuestion) return
-
-    if (!documentId) {
-      setError(
-        'Please upload and process a legal document first.',
-      )
-      return
+      await new Promise((resolve) => setTimeout(resolve, 1800))
     }
+    setGlobalError('Document processing timed out.')
+  }
 
-    if (status !== 'completed') {
-      setError(
-        'Please wait until the document is ready.',
+  const handleUpload = async () => {
+    if (!stagedFile) return
+    setUploading(true)
+    setGlobalError('')
+    setNeedsIndexHint(false)
+    setProgress(5)
+    setStatusNote('Uploading PDF...')
+
+    try {
+      const uploaded = await uploadDocument(stagedFile, ocrLanguage)
+      setStagedFile(null)
+      if (fileInputRef.current) fileInputRef.current.value = ''
+
+      setTurns([])
+      setInspectedSources([])
+      setInspectedClaims([])
+      setSessionId(crypto.randomUUID())
+      await refreshDocuments(uploaded.id)
+      await pollUntilComplete(uploaded.id)
+    } catch (err) {
+      setGlobalError(
+        err instanceof Error ? err.message : 'Failed to upload document.',
       )
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  const handleDeleteDossier = async (
+    docId: string,
+    event: React.MouseEvent,
+  ) => {
+    event.stopPropagation()
+    setGlobalError('')
+    try {
+      await deleteDocument(docId)
+      if (selectedDocId === docId) {
+        setSelectedDocId(null)
+        setSelectedDoc(null)
+        setTurns([])
+        setInspectedSources([])
+        setInspectedClaims([])
+        setActiveSummary(null)
+      }
+      await refreshDocuments()
+    } catch (err) {
+      setGlobalError(
+        err instanceof Error ? err.message : 'Failed to delete document.',
+      )
+    }
+  }
+
+  const handleAskQuestion = async (event: FormEvent) => {
+    event.preventDefault()
+    const trimmed = question.trim()
+    if (!trimmed || !selectedDocId || chatLoading) return
+    if (selectedDoc?.status !== 'completed') {
+      setGlobalError('Wait until document processing completes before asking.')
       return
     }
 
     setQuestion('')
-    setError('')
+    setGlobalError('')
+    setNeedsIndexHint(false)
+    setChatLoading(true)
+    setActiveNode('router')
+    setCompletedNodes([])
 
-    setMessages((previous) => [
-      ...previous,
-      {
-        role: 'user',
-        content: userQuestion,
-      },
+    const userTurnId = crypto.randomUUID()
+    const assistantTurnId = crypto.randomUUID()
+
+    setTurns((prev) => [
+      ...prev,
+      { id: userTurnId, role: 'user', content: trimmed },
+      { id: assistantTurnId, role: 'assistant', content: '', isStreaming: true },
     ])
 
-    setChatLoading(true)
-
     try {
-      const response = await axios.post(
-        `${API_BASE}/chat/${documentId}`,
+      await streamDocumentChat(
+        selectedDocId,
         {
-          // IMPORTANT:
-          // Backend expects "message", not "question".
-          message: userQuestion,
-
-          // Backend expects a session UUID.
+          message: trimmed,
           session_id: sessionId,
-
-          // Backend expects language codes.
-          language:
-            languageCodeMap[language] || 'en',
+          language,
+        },
+        (evt) => {
+          if (evt.type === 'progress') {
+            setActiveNode(evt.node)
+            setCompletedNodes((prev) =>
+              prev.includes(evt.node) ? prev : [...prev, evt.node],
+            )
+          } else if (evt.type === 'token') {
+            setTurns((prev) =>
+              prev.map((t) =>
+                t.id === assistantTurnId
+                  ? { ...t, content: t.content + evt.text }
+                  : t,
+              ),
+            )
+          } else if (evt.type === 'final') {
+            setSessionId(evt.session_id)
+            setActiveNode(null)
+            setCompletedNodes(evt.trace)
+            setTurns((prev) =>
+              prev.map((t) =>
+                t.id === assistantTurnId
+                  ? {
+                      ...t,
+                      content: evt.message,
+                      intent: evt.intent,
+                      verificationStatus: evt.verification_status,
+                      wasRefused: evt.was_refused,
+                      sources: evt.sources,
+                      claims: evt.claims,
+                      trace: evt.trace,
+                      isStreaming: false,
+                    }
+                  : t,
+              ),
+            )
+            setInspectedSources(evt.sources)
+            setInspectedClaims(evt.claims)
+            setActiveSourceIndex(0)
+          } else if (evt.type === 'error') {
+            setGlobalError(evt.detail)
+            if (evt.detail.toLowerCase().includes('vector index')) {
+              setNeedsIndexHint(true)
+            }
+            setTurns((prev) =>
+              prev.map((t) =>
+                t.id === assistantTurnId
+                  ? {
+                      ...t,
+                      content: evt.detail,
+                      wasRefused: true,
+                      verificationStatus: 'refused',
+                      isStreaming: false,
+                    }
+                  : t,
+              ),
+            )
+          }
         },
       )
-
-      const answer =
-        response.data?.answer ||
-        response.data?.message ||
-        'No answer returned.'
-
-      setMessages((previous) => [
-        ...previous,
-        {
-          role: 'assistant',
-          content: String(answer),
-        },
-      ])
-
-      const returnedSources =
-        Array.isArray(response.data?.sources)
-          ? response.data.sources
-          : []
-
-      setSources(returnedSources)
     } catch (err) {
-      console.error('Chat request failed:', err)
-
-      let errorMessage =
-        'Failed to get an answer. Please try again.'
-
-      if (axios.isAxiosError(err)) {
-        const detail = err.response?.data?.detail
-
-        if (typeof detail === 'string') {
-          errorMessage = detail
-        } else if (Array.isArray(detail)) {
-          errorMessage = detail
-            .map((item) => item?.msg || String(item))
-            .join(', ')
-        }
-      } else if (err instanceof Error) {
-        errorMessage = err.message
+      const msg =
+        err instanceof Error ? err.message : 'Failed to stream response.'
+      setGlobalError(msg)
+      if (msg.toLowerCase().includes('vector index')) {
+        setNeedsIndexHint(true)
       }
-
-      setError(errorMessage)
-
-      setMessages((previous) => [
-        ...previous,
-        {
-          role: 'assistant',
-          content:
-            'I could not process that question. Please try again.',
-        },
-      ])
+      setTurns((prev) =>
+        prev.map((t) =>
+          t.id === assistantTurnId
+            ? {
+                ...t,
+                content: 'Unable to complete the query. Please retry.',
+                wasRefused: true,
+                verificationStatus: 'refused',
+                isStreaming: false,
+              }
+            : t,
+        ),
+      )
     } finally {
       setChatLoading(false)
+      setActiveNode(null)
     }
   }
 
-  const getStatusLabel = () => {
-    if (uploading) return 'Uploading PDF'
-    if (indexing) return 'Building search index'
-
-    switch (status) {
-      case 'uploaded':
-        return 'Document uploaded'
-      case 'validating':
-        return 'Validating PDF'
-      case 'extracting':
-        return 'Extracting text'
-      case 'ocr_processing':
-        return 'Running OCR'
-      case 'preprocessing':
-        return 'Preprocessing document'
-      case 'analyzing':
-        return 'Analyzing legal structure'
-      case 'embedding':
-        return 'Creating embeddings'
-      case 'summarizing':
-        return 'Generating summary'
-      case 'completed':
-        return 'Document ready'
-      case 'failed':
-        return 'Processing failed'
-      default:
-        return 'Waiting for document'
+  const handleGenerateBrief = async (forceRefresh: boolean) => {
+    if (!selectedDocId || summaryLoading) return
+    setSummaryLoading(true)
+    setGlobalError('')
+    try {
+      const summary = await generateSummary(selectedDocId, {
+        summary_type: summaryType,
+        language,
+        force_refresh: forceRefresh,
+      })
+      setActiveSummary(summary)
+      const detail = await getDocument(selectedDocId)
+      setSelectedDoc(detail)
+    } catch (err) {
+      setGlobalError(
+        err instanceof Error ? err.message : 'Failed to generate summary.',
+      )
+    } finally {
+      setSummaryLoading(false)
     }
   }
+
+  const isDocReady = selectedDoc?.status === 'completed'
+  const isBusy =
+    uploading ||
+    indexing ||
+    (selectedDoc !== null &&
+      selectedDoc.status !== 'completed' &&
+      selectedDoc.status !== 'failed')
+
+  const currentSource = inspectedSources[activeSourceIndex] ?? null
 
   return (
-    <div className="app">
-      <header className="topbar">
-        <div className="brand">
-          <div className="brand-icon">
-            <BookOpen size={22} />
+    <div className="chamber-shell">
+      {/* ── Masthead ── */}
+      <header className="masthead">
+        <div className="masthead-row">
+          <div className="brand-lockup">
+            <div className="brand-emblem">
+              <Scale size={20} />
+            </div>
+            <div>
+              <h1 className="brand-title">NYAYASETU</h1>
+              <p className="brand-subtitle">
+                Indian Legal Document Intelligence Workspace
+              </p>
+            </div>
           </div>
 
-          <div>
-            <h1>NyayaSetu</h1>
-            <p>Legal documents, explained simply.</p>
-          </div>
-        </div>
+          <nav className="mode-switch" aria-label="Workspace mode">
+            <button
+              type="button"
+              className={`mode-btn ${activeTab === 'qa' ? 'active' : ''}`}
+              onClick={() => setActiveTab('qa')}
+            >
+              Document QA
+            </button>
+            <button
+              type="button"
+              className={`mode-btn ${activeTab === 'brief' ? 'active' : ''}`}
+              onClick={() => setActiveTab('brief')}
+            >
+              Structured Brief
+            </button>
+          </nav>
 
-        <div className="header-badge">
-          <span className="status-dot" />
-          Legal Document Assistant
+          <div className="masthead-controls">
+            <label className="lang-select-wrap">
+              <span>Language</span>
+              <select
+                value={language}
+                onChange={(e) => setLanguage(e.target.value as LanguageCode)}
+                disabled={chatLoading || summaryLoading}
+              >
+                <option value="en">English</option>
+                <option value="hi">हिंदी (Hindi)</option>
+                <option value="mr">मराठी (Marathi)</option>
+              </select>
+            </label>
+
+            <div className="sys-pill">
+              <span
+                className={`sys-dot ${backendOnline ? '' : 'offline'}`}
+              />
+              {backendOnline ? 'LANGGRAPH READY' : 'BACKEND OFFLINE'}
+            </div>
+          </div>
         </div>
       </header>
 
-      <main className="main-container">
-        <section className="hero">
-          <h2>Understand your legal document</h2>
+      {/* ── 3-Pane Workspace ── */}
+      <main className="chamber-grid">
+        {/* ── LEFT PANE: LODGED DOSSIERS ── */}
+        <aside className="pane dossier-pane">
+          <div className="pane-title-bar">
+            <h2 className="pane-kicker">Lodged Dossiers</h2>
+            <button
+              type="button"
+              className="icon-btn"
+              title="Refresh documents"
+              onClick={() => void refreshDocuments()}
+            >
+              <RefreshCw size={14} />
+            </button>
+          </div>
 
-          <p>
-            Upload an Indian legal document and ask questions
-            about its contents in simple language.
-          </p>
-        </section>
+          <div className="upload-box">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".pdf,application/pdf"
+              onChange={handleFileChange}
+              hidden
+            />
 
-        <div className="workspace">
-          <aside className="sidebar">
-            <div className="card upload-card">
-              <div className="card-header">
-                <h3>
-                  <FileText size={18} />
-                  Legal Document
-                </h3>
-
-                <p>
-                  Upload a PDF judgment or legal document.
-                </p>
-              </div>
-
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".pdf,application/pdf"
-                onChange={handleFileSelect}
-                hidden
-              />
-
-              {!selectedFile ? (
-                <button
-                  className="upload-zone"
-                  onClick={() =>
-                    fileInputRef.current?.click()
-                  }
-                  type="button"
-                >
-                  <Upload size={28} />
-                  <strong>Choose PDF</strong>
-                  <span>
-                    Click to select a legal document
-                  </span>
-                  <small>Maximum size: 50 MB</small>
-                </button>
-              ) : (
-                <div className="selected-file">
-                  <div className="file-icon">
-                    <FileText size={22} />
-                  </div>
-
-                  <div className="file-details">
-                    <strong>{selectedFile.name}</strong>
-                    <span>
-                      {(
-                        selectedFile.size /
-                        1024 /
-                        1024
-                      ).toFixed(2)}{' '}
-                      MB
-                    </span>
-                  </div>
-
-                  {!isProcessing && (
-                    <button
-                      className="icon-button"
-                      onClick={resetDocument}
-                      title="Remove document"
-                      type="button"
-                    >
-                      <X size={18} />
-                    </button>
-                  )}
-                </div>
-              )}
-
-              {selectedFile &&
-                !documentId &&
-                !uploading && (
-                  <button
-                    className="primary-button"
-                    onClick={uploadDocument}
-                    type="button"
-                  >
-                    <Upload size={17} />
-                    Upload & Process
-                  </button>
-                )}
-
-              {documentId &&
-                (isProcessing ||
-                  status === 'completed') && (
-                  <div className="processing-panel">
-                    <div className="processing-header">
-                      <span>
-                        {status === 'completed' ? (
-                          <CheckCircle2 size={17} />
-                        ) : (
-                          <Loader2
-                            size={17}
-                            className="spin"
-                          />
-                        )}
-
-                        {getStatusLabel()}
-                      </span>
-
-                      <strong>{progress}%</strong>
-                    </div>
-
-                    <div className="progress-track">
-                      <div
-                        className="progress-bar"
-                        style={{
-                          width: `${progress}%`,
-                        }}
-                      />
-                    </div>
-
-                    <p>{statusMessage}</p>
-                  </div>
-                )}
-
-              {status === 'completed' &&
-                documentId && (
-                  <div className="ready-message">
-                    <CheckCircle2 size={18} />
-
-                    <div>
-                      <strong>Document ready</strong>
-                      <span>
-                        You can now ask questions about this
-                        document.
-                      </span>
-                    </div>
-                  </div>
-                )}
-
-              {status === 'failed' && (
-                <div className="error-box">
-                  <AlertCircle size={18} />
-                  <span>
-                    {error ||
-                      'Document processing failed.'}
-                  </span>
-                </div>
-              )}
-
-              {error &&
-                status !== 'failed' && (
-                  <div className="error-box">
-                    <AlertCircle size={18} />
-                    <span>{error}</span>
-                  </div>
-                )}
-            </div>
-
-            <div className="card language-card">
-              <h3>
-                <Languages size={18} />
-                Response Language
-              </h3>
-
-              <select
-                value={language}
-                onChange={(event) =>
-                  setLanguage(event.target.value)
-                }
-                disabled={chatLoading}
+            {!stagedFile ? (
+              <button
+                type="button"
+                className="dropzone-btn"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={uploading || indexing}
               >
-                <option value="English">
-                  English
-                </option>
-                <option value="Hindi">
-                  Hindi
-                </option>
-                <option value="Marathi">
-                  Marathi
-                </option>
-              </select>
-            </div>
-
-            <div className="info-card">
-              <strong>Important</strong>
-
-              <p>
-                NyayaSetu provides informational assistance and
-                does not replace advice from a qualified lawyer.
-              </p>
-            </div>
-          </aside>
-
-          <section className="chat-panel">
-            <div className="chat-header">
-              <div>
-                <h3>
-                  <MessageSquare size={19} />
-                  Document Chat
-                </h3>
-
-                <p>
-                  Ask questions about the uploaded document.
-                </p>
-              </div>
-
-              {documentId &&
-                status === 'completed' && (
-                  <span className="ready-pill">
-                    <CheckCircle2 size={14} />
-                    Ready
-                  </span>
-                )}
-            </div>
-
-            <div className="messages">
-              {messages.length === 0 ? (
-                <div className="empty-chat">
-                  <div className="empty-icon">
-                    <MessageSquare size={30} />
-                  </div>
-
-                  <h3>Ask about your document</h3>
-
-                  <p>
-                    Upload a legal PDF and ask questions such
-                    as:
-                  </p>
-
-                  <div className="question-examples">
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setQuestion(
-                          'What is this case mainly about?',
-                        )
-                      }
-                    >
-                      What is this case mainly about?
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setQuestion(
-                          'What were the main arguments of the parties?',
-                        )
-                      }
-                    >
-                      What were the main arguments?
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setQuestion(
-                          'What was the final decision?',
-                        )
-                      }
-                    >
-                      What was the final decision?
-                    </button>
-                  </div>
+                <Upload size={20} />
+                <strong>Lodge Legal PDF</strong>
+                <span>Judgments, contracts, notices (max 50 MB)</span>
+              </button>
+            ) : (
+              <div className="staged-file">
+                <FileText size={18} />
+                <div className="staged-file-meta">
+                  <strong>{stagedFile.name}</strong>
+                  <span>{(stagedFile.size / 1024 / 1024).toFixed(2)} MB</span>
                 </div>
-              ) : (
-                messages.map((message, index) => (
-                  <div
-                    className={`message-row ${message.role}`}
-                    key={index}
-                  >
-                    <div className="message-bubble">
-                      {message.role === 'assistant' ? (
-                        <ReactMarkdown>
-                          {message.content}
-                        </ReactMarkdown>
-                      ) : (
-                        <p>{message.content}</p>
-                      )}
-                    </div>
-                  </div>
-                ))
-              )}
-
-              {chatLoading && (
-                <div className="message-row assistant">
-                  <div className="message-bubble loading-message">
-                    <Loader2
-                      size={18}
-                      className="spin"
-                    />
-                    <span>
-                      Analyzing the document...
-                    </span>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            {sources.length > 0 && (
-              <div className="sources">
-                <strong>
-                  Sources from document
-                </strong>
-
-                <div className="source-list">
-                  {sources.map(
-                    (source, index) => (
-                      <div
-                        className="source-item"
-                        key={index}
-                      >
-                        <span>
-                          Source {index + 1}
-                        </span>
-
-                        {source.page_number && (
-                          <span>
-                            Page{' '}
-                            {source.page_number}
-                          </span>
-                        )}
-
-                        {source.section_type && (
-                          <span>
-                            {source.section_type}
-                          </span>
-                        )}
-
-                        {typeof source.score ===
-                          'number' && (
-                          <span>
-                            Relevance:{' '}
-                            {(
-                              source.score * 100
-                            ).toFixed(1)}
-                            %
-                          </span>
-                        )}
-                      </div>
-                    ),
-                  )}
-                </div>
+                <button
+                  type="button"
+                  className="icon-btn"
+                  onClick={() => {
+                    setStagedFile(null)
+                    if (fileInputRef.current) fileInputRef.current.value = ''
+                  }}
+                >
+                  <X size={15} />
+                </button>
               </div>
             )}
 
-            <form
-              className="chat-input-area"
-              onSubmit={handleSubmit}
-            >
-              <input
-                value={question}
-                onChange={(event) =>
-                  setQuestion(event.target.value)
+            <div className="ocr-row">
+              <label htmlFor="ocr-lang">OCR Language</label>
+              <select
+                id="ocr-lang"
+                value={ocrLanguage}
+                onChange={(e) =>
+                  setOcrLanguage(e.target.value as OcrLanguageCode)
                 }
-                placeholder={
-                  status === 'completed'
-                    ? 'Ask a question about this document...'
-                    : 'Upload a document to start chatting...'
-                }
-                disabled={
-                  status !== 'completed' ||
-                  chatLoading ||
-                  indexing
-                }
-              />
-
-              <button
-                type="submit"
-                disabled={
-                  !question.trim() ||
-                  status !== 'completed' ||
-                  chatLoading
-                }
-                title="Send question"
+                disabled={uploading}
               >
-                {chatLoading ? (
-                  <Loader2
-                    size={19}
-                    className="spin"
-                  />
+                <option value="eng">eng (Fast)</option>
+                <option value="eng+hin">eng+hin</option>
+                <option value="eng+mar">eng+mar</option>
+                <option value="eng+hin+mar">eng+hin+mar</option>
+              </select>
+            </div>
+
+            {stagedFile && (
+              <button
+                type="button"
+                className="btn-primary"
+                onClick={() => void handleUpload()}
+                disabled={uploading || indexing}
+              >
+                {uploading ? (
+                  <Loader2 size={15} className="spin" />
                 ) : (
-                  <Send size={19} />
+                  <Upload size={15} />
                 )}
+                {uploading ? 'Processing...' : 'Upload, Extract & Index'}
               </button>
-            </form>
-          </section>
-        </div>
+            )}
+
+            {isBusy && (
+              <div className="progress-card">
+                <div className="progress-head">
+                  <span>
+                    <Loader2 size={13} className="spin" />
+                    {indexing ? 'Indexing vectors' : 'Processing PDF'}
+                  </span>
+                  <span>{progress}%</span>
+                </div>
+                <div className="progress-track">
+                  <div
+                    className="progress-fill"
+                    style={{ width: `${Math.min(100, Math.max(5, progress))}%` }}
+                  />
+                </div>
+                {statusNote && <p className="progress-note">{statusNote}</p>}
+              </div>
+            )}
+          </div>
+
+          <div className="dossier-list">
+            {documents.length === 0 ? (
+              <div className="dossier-empty">
+                No documents lodged yet. Upload a PDF above to begin.
+              </div>
+            ) : (
+              documents.map((doc) => {
+                const badgeClass =
+                  doc.status === 'completed'
+                    ? 'completed'
+                    : doc.status === 'failed'
+                      ? 'failed'
+                      : 'processing'
+                return (
+                  <div
+                    key={doc.id}
+                    className={`dossier-item ${selectedDocId === doc.id ? 'selected' : ''}`}
+                    onClick={() => handleSelectDossier(doc.id)}
+                    role="button"
+                    tabIndex={0}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        handleSelectDossier(doc.id)
+                      }
+                    }}
+                  >
+                    <div className="dossier-item-top">
+                      <div className="dossier-name">
+                        <FileText size={15} />
+                        <strong>{doc.filename}</strong>
+                      </div>
+                      <button
+                        type="button"
+                        className="icon-btn danger"
+                        title="Delete document"
+                        onClick={(e) => void handleDeleteDossier(doc.id, e)}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                    <div className="dossier-item-bottom">
+                      <span className={`status-badge ${badgeClass}`}>
+                        {doc.status === 'completed' && (
+                          <CheckCircle2 size={11} />
+                        )}
+                        {doc.status}
+                      </span>
+                      <span
+                        style={{
+                          fontFamily: 'var(--font-mono)',
+                          fontSize: '10px',
+                          color: 'var(--ink-muted)',
+                        }}
+                      >
+                        {Math.round(doc.progress || 0)}%
+                      </span>
+                    </div>
+                  </div>
+                )
+              })
+            )}
+          </div>
+        </aside>
+
+        {/* ── CENTER PANE: COUNSEL Q&A OR STRUCTURED BRIEF ── */}
+        <section className="pane center-pane">
+          <div className="pane-title-bar">
+            <h2 className="pane-kicker">
+              {activeTab === 'qa'
+                ? 'Counsel Q&A Workspace'
+                : 'Structured Legal Brief'}
+            </h2>
+            {selectedDoc && (
+              <div className="case-strip-actions">
+                <button
+                  type="button"
+                  className="btn-secondary"
+                  disabled={!isDocReady || indexing}
+                  onClick={() => void handleBuildIndex(selectedDoc.id)}
+                  title="Build or rebuild FAISS + BM25 search index"
+                >
+                  {indexing ? (
+                    <Loader2 size={13} className="spin" />
+                  ) : (
+                    <Database size={13} />
+                  )}
+                  Index
+                </button>
+                {activeTab === 'qa' && (
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    onClick={() => {
+                      setTurns([])
+                      setInspectedSources([])
+                      setInspectedClaims([])
+                      setCompletedNodes([])
+                      setSessionId(crypto.randomUUID())
+                    }}
+                  >
+                    New Thread
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+
+          {selectedDoc && (
+            <div className="case-strip">
+              <div className="case-strip-title">
+                <BookOpen size={16} />
+                <strong>{selectedDoc.original_filename}</strong>
+              </div>
+              <div className="case-strip-actions">
+                <span className="meta-chip">{selectedDoc.page_count} pages</span>
+                <span className="meta-chip">
+                  {selectedDoc.document_type || 'legal'}
+                </span>
+                {selectedDoc.pdf_type && (
+                  <span className="meta-chip">{selectedDoc.pdf_type}</span>
+                )}
+              </div>
+            </div>
+          )}
+
+          {globalError && (
+            <div className="error-banner">
+              <div className="error-banner-text">
+                <AlertCircle size={16} />
+                <span>{globalError}</span>
+              </div>
+              <div className="case-strip-actions">
+                {needsIndexHint && selectedDocId && (
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    onClick={() => void handleBuildIndex(selectedDocId)}
+                  >
+                    Index Now
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="icon-btn"
+                  onClick={() => setGlobalError('')}
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'qa' ? (
+            <>
+              {/* Live LangGraph Pipeline Stepper */}
+              <div className="pipeline-bar">
+                <div className="pipeline-label">
+                  LangGraph Verification Pipeline
+                </div>
+                <div className="pipeline-steps">
+                  {QA_PIPELINE_NODES.map((node, idx) => {
+                    const isActive = activeNode === node.key
+                    const isDone =
+                      !isActive && completedNodes.includes(node.key)
+                    return (
+                      <span
+                        key={node.key}
+                        style={{
+                          display: 'inline-flex',
+                          alignItems: 'center',
+                          gap: '6px',
+                        }}
+                      >
+                        <span
+                          className={`pipeline-node ${
+                            isActive ? 'active' : isDone ? 'done' : ''
+                          }`}
+                        >
+                          {isActive && <Loader2 size={10} className="spin" />}
+                          {node.label}
+                        </span>
+                        {idx < QA_PIPELINE_NODES.length - 1 && (
+                          <span className="pipeline-arrow">→</span>
+                        )}
+                      </span>
+                    )
+                  })}
+                </div>
+              </div>
+
+              {/* Conversation Feed */}
+              <div className="qa-scroll">
+                {!selectedDoc ? (
+                  <div className="empty-state">
+                    <Scale size={30} color="var(--accent-vermilion)" />
+                    <h2>Select or Lodge a Legal Dossier</h2>
+                    <p>
+                      Upload an Indian court judgment, contract, or legal notice
+                      in English, Hindi, or Marathi. Every answer is retrieved
+                      via hybrid search and verified against cited passages.
+                    </p>
+                  </div>
+                ) : turns.length === 0 ? (
+                  <div className="empty-state">
+                    <h2>Examine This Document</h2>
+                    <p>
+                      Ask factual questions, look up specific sections, or ask
+                      for plain-language explanations. Follow-up questions keep
+                      context across turns.
+                    </p>
+                    <div className="prompt-chips">
+                      {SUGGESTED_QUESTIONS.map((sample) => (
+                        <button
+                          key={sample}
+                          type="button"
+                          className="prompt-chip"
+                          onClick={() => setQuestion(sample)}
+                        >
+                          {sample}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  turns.map((turn) =>
+                    turn.role === 'user' ? (
+                      <article key={turn.id} className="qa-card user-q">
+                        <div className="qa-card-head">
+                          <span className="qa-role-tag">Question</span>
+                        </div>
+                        <p className="qa-question-text">{turn.content}</p>
+                      </article>
+                    ) : (
+                      <article key={turn.id} className="qa-card assistant-a">
+                        <div className="qa-card-head">
+                          <span className="qa-role-tag">
+                            Verified Response
+                            {turn.intent ? ` · ${turn.intent}` : ''}
+                          </span>
+                          {turn.verificationStatus && (
+                            <span
+                              className={`verify-stamp ${
+                                turn.verificationStatus === 'verified'
+                                  ? 'verified'
+                                  : turn.verificationStatus === 'refused'
+                                    ? 'refused'
+                                    : 'partial'
+                              }`}
+                            >
+                              {turn.verificationStatus === 'verified' ? (
+                                <ShieldCheck size={12} />
+                              ) : (
+                                <ShieldAlert size={12} />
+                              )}
+                              {turn.verificationStatus.replace('_', ' ')}
+                            </span>
+                          )}
+                        </div>
+
+                        {turn.isStreaming && !turn.content ? (
+                          <div
+                            style={{
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: '8px',
+                              color: 'var(--ink-muted)',
+                              fontSize: '13px',
+                            }}
+                          >
+                            <Loader2 size={15} className="spin" />
+                            <span>
+                              Running LangGraph node:{' '}
+                              <strong>{activeNode || 'starting'}</strong>...
+                            </span>
+                          </div>
+                        ) : (
+                          <div className="markdown-body">
+                            <ReactMarkdown>{turn.content}</ReactMarkdown>
+                          </div>
+                        )}
+
+                        {turn.sources && turn.sources.length > 0 && (
+                          <div className="citation-row">
+                            <span className="citation-label">
+                              Cited Passages:
+                            </span>
+                            {turn.sources.map((src, sIdx) => {
+                              const isSelected =
+                                inspectedSources === turn.sources &&
+                                activeSourceIndex === sIdx
+                              return (
+                                <button
+                                  key={sIdx}
+                                  type="button"
+                                  className={`citation-chip ${isSelected ? 'active' : ''}`}
+                                  onClick={() => {
+                                    setInspectedSources(turn.sources || [])
+                                    setInspectedClaims(turn.claims || [])
+                                    setActiveSourceIndex(sIdx)
+                                  }}
+                                >
+                                  S{sIdx + 1}
+                                  {src.page ? ` · p.${src.page}` : ''}
+                                </button>
+                              )
+                            })}
+                          </div>
+                        )}
+
+                        {turn.trace && turn.trace.length > 0 && (
+                          <div className="trace-footnote">
+                            Trace: {turn.trace.join(' → ')}
+                          </div>
+                        )}
+                      </article>
+                    ),
+                  )
+                )}
+                <div ref={qaEndRef} />
+              </div>
+
+              {/* Question Input */}
+              <form className="composer" onSubmit={(e) => void handleAskQuestion(e)}>
+                <input
+                  value={question}
+                  onChange={(e) => setQuestion(e.target.value)}
+                  placeholder={
+                    isDocReady
+                      ? 'Ask a grounded question about this legal document...'
+                      : 'Select or upload a completed document to begin...'
+                  }
+                  disabled={!isDocReady || chatLoading || indexing}
+                />
+                <button
+                  type="submit"
+                  className="composer-send"
+                  disabled={!question.trim() || !isDocReady || chatLoading}
+                >
+                  {chatLoading ? (
+                    <Loader2 size={15} className="spin" />
+                  ) : (
+                    <Send size={15} />
+                  )}
+                  Ask
+                </button>
+              </form>
+            </>
+          ) : (
+            /* ── STRUCTURED BRIEF TAB ── */
+            <>
+              <div className="brief-toolbar">
+                <div className="brief-controls">
+                  <select
+                    value={summaryType}
+                    onChange={(e) =>
+                      setSummaryType(e.target.value as SummaryLength)
+                    }
+                    disabled={summaryLoading}
+                  >
+                    <option value="short">Short Brief</option>
+                    <option value="medium">Medium Brief</option>
+                    <option value="detailed">Detailed Brief</option>
+                  </select>
+
+                  <button
+                    type="button"
+                    className="btn-primary"
+                    style={{ width: 'auto', marginTop: 0 }}
+                    disabled={!isDocReady || summaryLoading}
+                    onClick={() => void handleGenerateBrief(Boolean(activeSummary))}
+                  >
+                    {summaryLoading ? (
+                      <Loader2 size={14} className="spin" />
+                    ) : (
+                      <BookOpen size={14} />
+                    )}
+                    {summaryLoading
+                      ? 'Generating Verified Brief...'
+                      : activeSummary
+                        ? 'Regenerate Brief'
+                        : 'Generate Structured Brief'}
+                  </button>
+                </div>
+
+                {activeSummary && selectedDocId && (
+                  <div className="brief-controls">
+                    <a
+                      className="btn-secondary"
+                      href={getSummaryExportUrl(
+                        selectedDocId,
+                        activeSummary.summary_type,
+                        activeSummary.language,
+                        'md',
+                      )}
+                    >
+                      <Download size={13} />
+                      Export .MD
+                    </a>
+                    <a
+                      className="btn-secondary"
+                      href={getSummaryExportUrl(
+                        selectedDocId,
+                        activeSummary.summary_type,
+                        activeSummary.language,
+                        'json',
+                      )}
+                    >
+                      <Download size={13} />
+                      Export .JSON
+                    </a>
+                  </div>
+                )}
+              </div>
+
+              <div className="brief-scroll">
+                {!selectedDoc ? (
+                  <div className="empty-state">
+                    <h2>No Document Selected</h2>
+                    <p>Select a document from the left pane to generate its structured legal brief.</p>
+                  </div>
+                ) : summaryLoading ? (
+                  <div className="empty-state">
+                    <Loader2 size={28} className="spin" color="var(--accent-vermilion)" />
+                    <h2>Drafting & Verifying Brief</h2>
+                    <p>
+                      Detecting document type, summarizing sections hierarchically,
+                      and verifying claims against document pages...
+                    </p>
+                  </div>
+                ) : !activeSummary ? (
+                  <div className="empty-state">
+                    <h2>Structured Legal Digest</h2>
+                    <p>
+                      Generate an Indian Law Report–style judgment brief or a
+                      clause-by-clause contract risk brief with page references
+                      and claim verification.
+                    </p>
+                  </div>
+                ) : (
+                  <>
+                    <div className="brief-meta-grid">
+                      <div className="brief-meta-card">
+                        <span>Document Type</span>
+                        <strong>{activeSummary.document_type.toUpperCase()}</strong>
+                      </div>
+                      <div className="brief-meta-card">
+                        <span>Verification</span>
+                        <strong>
+                          {activeSummary.verification_status.replace('_', ' ').toUpperCase()}
+                        </strong>
+                      </div>
+                      {activeSummary.structured_summary.court && (
+                        <div className="brief-meta-card">
+                          <span>Court / Forum</span>
+                          <strong>{activeSummary.structured_summary.court}</strong>
+                        </div>
+                      )}
+                      {activeSummary.structured_summary.case_number && (
+                        <div className="brief-meta-card">
+                          <span>Case Number</span>
+                          <strong>
+                            {activeSummary.structured_summary.case_number}
+                          </strong>
+                        </div>
+                      )}
+                      {(activeSummary.structured_summary.date ||
+                        activeSummary.structured_summary.effective_date) && (
+                        <div className="brief-meta-card">
+                          <span>Date</span>
+                          <strong>
+                            {activeSummary.structured_summary.date ||
+                              activeSummary.structured_summary.effective_date}
+                          </strong>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="brief-section-card">
+                      <h4>Executive Digest</h4>
+                      <div className="markdown-body">
+                        <ReactMarkdown>{activeSummary.content}</ReactMarkdown>
+                      </div>
+                    </div>
+
+                    {activeSummary.structured_summary.holding && (
+                      <div className="brief-section-card">
+                        <h4>Holding & Final Order</h4>
+                        <p style={{ margin: '0 0 8px', fontSize: '13.5px', lineHeight: 1.65 }}>
+                          <strong>Holding: </strong>
+                          {activeSummary.structured_summary.holding}
+                        </p>
+                        {activeSummary.structured_summary.final_order && (
+                          <p style={{ margin: 0, fontSize: '13.5px', lineHeight: 1.65 }}>
+                            <strong>Final Order: </strong>
+                            {activeSummary.structured_summary.final_order}
+                          </p>
+                        )}
+                      </div>
+                    )}
+
+                    {activeSummary.structured_summary.parties &&
+                      activeSummary.structured_summary.parties.length > 0 && (
+                        <div className="brief-section-card">
+                          <h4>Parties</h4>
+                          <ul className="brief-list">
+                            {activeSummary.structured_summary.parties.map((p, i) => (
+                              <li key={i}>{p}</li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+
+                    {activeSummary.structured_summary.issues &&
+                      activeSummary.structured_summary.issues.length > 0 && (
+                        <div className="brief-section-card">
+                          <h4>Issues & Reasoning</h4>
+                          <ul className="brief-list">
+                            {activeSummary.structured_summary.issues.map((item, i) => (
+                              <li key={`iss-${i}`}>{item}</li>
+                            ))}
+                            {(activeSummary.structured_summary.reasoning || []).map(
+                              (item, i) => (
+                                <li key={`rsn-${i}`}>{item}</li>
+                              ),
+                            )}
+                          </ul>
+                        </div>
+                      )}
+
+                    {activeSummary.structured_summary.unusual_or_one_sided_clauses &&
+                      activeSummary.structured_summary.unusual_or_one_sided_clauses
+                        .length > 0 && (
+                        <div className="brief-section-card">
+                          <h4>Unusual or One-Sided Clauses</h4>
+                          {activeSummary.structured_summary.unusual_or_one_sided_clauses.map(
+                            (clause, i) => (
+                              <div key={i} className="risk-clause-box">
+                                <strong>{clause.clause_reference}</strong>
+                                <span>{clause.risk_explanation}</span>
+                              </div>
+                            ),
+                          )}
+                        </div>
+                      )}
+
+                    {activeSummary.trace.length > 0 && (
+                      <div className="trace-footnote">
+                        LangGraph Trace: {activeSummary.trace.join(' → ')}
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            </>
+          )}
+        </section>
+
+        {/* ── RIGHT PANE: EVIDENCE INSPECTOR ── */}
+        <aside className="pane evidence-pane">
+          <div className="pane-title-bar">
+            <h2 className="pane-kicker">Evidence Inspector</h2>
+            {activeTab === 'qa' && inspectedSources.length > 0 && (
+              <span className="meta-chip">
+                {inspectedSources.length} sources
+              </span>
+            )}
+          </div>
+
+          <div className="evidence-body">
+            {activeTab === 'brief' ? (
+              activeSummary && activeSummary.claims.length > 0 ? (
+                <div className="claims-box" style={{ borderTop: 0, paddingTop: 0 }}>
+                  <h5>Verified Summary Claims ({activeSummary.claims.length})</h5>
+                  {activeSummary.claims.map((claim, idx) => (
+                    <div key={idx} className="claim-item">
+                      <div>{claim.text}</div>
+                      {claim.pages.length > 0 && (
+                        <div className="claim-item-meta">
+                          <ShieldCheck size={12} />
+                          Pages: {claim.pages.join(', ')}
+                        </div>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="dossier-empty">
+                  Verified summary claims and page mappings will appear here
+                  after generating a brief.
+                </div>
+              )
+            ) : currentSource ? (
+              <>
+                <div className="evidence-tabs">
+                  {inspectedSources.map((src, idx) => (
+                    <button
+                      key={idx}
+                      type="button"
+                      className={`citation-chip ${activeSourceIndex === idx ? 'active' : ''}`}
+                      onClick={() => setActiveSourceIndex(idx)}
+                    >
+                      S{idx + 1}
+                      {src.page ? ` (p.${src.page})` : ''}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="evidence-card">
+                  <div className="evidence-meta">
+                    <span className="evidence-badge">
+                      SOURCE S{activeSourceIndex + 1}
+                    </span>
+                    {currentSource.page !== null && (
+                      <span className="meta-chip">Page {currentSource.page}</span>
+                    )}
+                    {currentSource.section && (
+                      <span className="meta-chip">{currentSource.section}</span>
+                    )}
+                    {currentSource.paragraph && (
+                      <span className="meta-chip">
+                        Para {currentSource.paragraph}
+                      </span>
+                    )}
+                  </div>
+                  <p className="evidence-excerpt">
+                    {currentSource.content || 'No excerpt text available.'}
+                  </p>
+                </div>
+
+                {inspectedClaims.length > 0 && (
+                  <div className="claims-box">
+                    <h5>Verified Claims ({inspectedClaims.length})</h5>
+                    {inspectedClaims.map((claim, idx) => (
+                      <div key={idx} className="claim-item">
+                        <div>{claim.text}</div>
+                        <div className="claim-item-meta">
+                          <ShieldCheck size={12} />
+                          <span>{claim.source_ids.join(', ')}</span>
+                          {claim.pages.length > 0 && (
+                            <span>· Page {claim.pages.join(', ')}</span>
+                          )}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="dossier-empty">
+                Ask a question to inspect the exact supporting document passages,
+                page numbers, and verified claims here.
+              </div>
+            )}
+          </div>
+        </aside>
       </main>
 
-      <footer>
-        <span>NyayaSetu</span>
+      <footer className="chamber-footer">
         <span>
-          Informational assistance only • Not legal advice
+          <strong>NyayaSetu</strong> — Document-Grounded Indian Legal AI
+        </span>
+        <span>
+          Informational assistance only · Not a substitute for professional legal advice
         </span>
       </footer>
     </div>
