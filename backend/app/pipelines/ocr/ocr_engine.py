@@ -1,26 +1,81 @@
 """OCR pipeline using Tesseract OCR.
 
-Supports English, Hindi, and Marathi OCR with page-level
-confidence tracking and low-confidence detection.
+Supports English, Hindi, and Marathi OCR with single-pass text +
+confidence extraction and configurable language selection.
 """
 
+from __future__ import annotations
+
 import io
-from typing import Optional
+import os
+from typing import Any, Optional
 
 from PIL import Image
 
 from app.core.config import get_settings
-from app.core.logging_config import get_logger
 from app.core.exceptions import OCRError
+from app.core.logging_config import get_logger
 
 
 logger = get_logger("ocr")
+
+ALLOWED_OCR_LANGUAGES = frozenset(
+    {
+        "eng",
+        "hin",
+        "mar",
+        "eng+hin",
+        "eng+mar",
+        "hin+mar",
+        "eng+hin+mar",
+    }
+)
+
+
+def reconstruct_text_from_tsv_data(data: dict[str, list[Any]]) -> str:
+    """
+    Rebuild formatted text from pytesseract image_to_data output.
+
+    Groups words by (block_num, par_num, line_num) in reading order,
+    inserting newlines between lines and blank lines between paragraphs.
+    """
+    texts = data.get("text", [])
+    block_nums = data.get("block_num", [])
+    par_nums = data.get("par_num", [])
+    line_nums = data.get("line_num", [])
+
+    # Preserve document order using insertion-ordered dicts.
+    paragraphs: dict[tuple[int, int], dict[int, list[str]]] = {}
+
+    count = min(len(texts), len(block_nums), len(par_nums), len(line_nums))
+    for i in range(count):
+        word = str(texts[i]).strip()
+        if not word:
+            continue
+
+        par_key = (int(block_nums[i]), int(par_nums[i]))
+        line_key = int(line_nums[i])
+
+        lines = paragraphs.setdefault(par_key, {})
+        lines.setdefault(line_key, []).append(word)
+
+    paragraph_strings: list[str] = []
+    for lines in paragraphs.values():
+        line_strings = [" ".join(words) for words in lines.values() if words]
+        if line_strings:
+            paragraph_strings.append("\n".join(line_strings))
+
+    return "\n\n".join(paragraph_strings).strip()
 
 
 class OCREngine:
     """Abstract OCR engine interface."""
 
-    def ocr_image(self, image_bytes: bytes) -> dict:
+    def ocr_image(
+        self,
+        image_bytes: bytes,
+        language: Optional[str] = None,
+    ) -> dict[str, Any]:
         """
         Perform OCR on an image.
 
@@ -35,21 +90,25 @@ class OCREngine:
 
 
 class TesseractOCREngine(OCREngine):
-    """Tesseract OCR engine supporting English, Hindi and Marathi."""
+    """Tesseract OCR engine supporting English, Hindi, and Marathi."""
 
-    def __init__(self) -> None:
+    def __init__(self, language: Optional[str] = None) -> None:
         settings = get_settings()
+
+        # Prevent Tesseract OpenMP threads from oversubscribing CPU cores
+        # when pages are OCR'd concurrently in ThreadPoolExecutor.
+        os.environ["OMP_THREAD_LIMIT"] = "1"
 
         try:
             import pytesseract
 
-            pytesseract.pytesseract.tesseract_cmd = settings.tesseract_cmd
+            if settings.tesseract_cmd:
+                pytesseract.pytesseract.tesseract_cmd = settings.tesseract_cmd
 
-            # Verify that Tesseract is actually available.
             version = pytesseract.get_tesseract_version()
 
             self._pytesseract = pytesseract
-            self._language = "eng+hin+mar"
+            self._language = language or settings.ocr_languages or "eng"
 
             logger.info(
                 "tesseract_initialized",
@@ -57,44 +116,42 @@ class TesseractOCREngine(OCREngine):
                 language=self._language,
             )
 
-        except Exception as e:
+        except Exception as exc:
             logger.error(
                 "tesseract_init_failed",
-                error=str(e),
+                error=str(exc),
             )
             self._pytesseract = None
+            self._language = language or settings.ocr_languages or "eng"
 
-    def ocr_image(self, image_bytes: bytes) -> dict:
-        """Run Tesseract OCR on a single image."""
-
+    def ocr_image(
+        self,
+        image_bytes: bytes,
+        language: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Run single-pass Tesseract OCR (text + word confidences) on one image."""
         if self._pytesseract is None:
             raise OCRError("Tesseract is not available")
 
+        lang = language or self._language
+
         try:
             image = Image.open(io.BytesIO(image_bytes))
-
-            # Convert images to RGB to avoid problems with
-            # grayscale/RGBA PDF renderings.
             if image.mode != "RGB":
                 image = image.convert("RGB")
 
-            # OCR text.
-            text = self._pytesseract.image_to_string(
-                image,
-                lang=self._language,
-                config="--psm 3",
-            )
-
-            # OCR confidence information.
+            # Single Tesseract pass returns words, layout structure, and confidences.
             data = self._pytesseract.image_to_data(
                 image,
-                lang=self._language,
+                lang=lang,
                 config="--psm 3",
                 output_type=self._pytesseract.Output.DICT,
             )
 
+            text = reconstruct_text_from_tsv_data(data)
+
             confidences: list[float] = []
-            details: list[dict] = []
+            details: list[dict[str, Any]] = []
 
             for index, confidence in enumerate(data["conf"]):
                 try:
@@ -102,17 +159,14 @@ class TesseractOCREngine(OCREngine):
                 except (TypeError, ValueError):
                     continue
 
-                # Tesseract uses -1 for non-text regions.
                 if confidence_value < 0:
                     continue
 
-                word = data["text"][index].strip()
-
+                word = str(data["text"][index]).strip()
                 if not word:
                     continue
 
                 confidences.append(confidence_value)
-
                 details.append(
                     {
                         "text": word,
@@ -126,7 +180,6 @@ class TesseractOCREngine(OCREngine):
                     }
                 )
 
-            # Convert 0-100 Tesseract confidence to 0-1.
             average_confidence = (
                 sum(confidences) / len(confidences) / 100.0
                 if confidences
@@ -134,61 +187,47 @@ class TesseractOCREngine(OCREngine):
             )
 
             return {
-                "text": text.strip(),
+                "text": text,
                 "confidence": round(average_confidence, 4),
                 "details": details,
             }
 
-        except Exception as e:
+        except Exception as exc:
             logger.error(
                 "tesseract_failed",
-                error=str(e),
+                language=lang,
+                error=str(exc),
             )
-
-            raise OCRError(
-                f"Tesseract OCR processing failed: {str(e)}"
-            )
+            raise OCRError(f"Tesseract OCR processing failed: {str(exc)}") from exc
 
 
 class OCRPipeline:
     """OCR pipeline using Tesseract with confidence tracking."""
 
-    def __init__(self) -> None:
+    def __init__(self, language: Optional[str] = None) -> None:
         settings = get_settings()
 
         self._settings = settings
+        self._language = language or settings.ocr_languages or "eng"
         self._engine: Optional[OCREngine] = None
 
         try:
-            self._engine = TesseractOCREngine()
-
-            if self._engine._pytesseract is None:
-                self._engine = None
-
-        except Exception as e:
+            engine = TesseractOCREngine(language=self._language)
+            if engine._pytesseract is not None:
+                self._engine = engine
+        except Exception as exc:
             logger.error(
                 "ocr_pipeline_initialization_failed",
-                error=str(e),
+                error=str(exc),
             )
 
     def ocr_page(
         self,
         image_bytes: bytes,
         page_number: int = 1,
-    ) -> dict:
-        """
-        OCR a single page image.
-
-        Returns:
-            {
-                "text": str,
-                "confidence": float,
-                "engine": str,
-                "is_low_confidence": bool,
-                "details": list
-            }
-        """
-
+        language: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """OCR a single page image."""
         if self._engine is None:
             raise OCRError(
                 f"No OCR engine is available for page {page_number}",
@@ -196,21 +235,20 @@ class OCRPipeline:
             )
 
         try:
-            result = self._engine.ocr_image(image_bytes)
-
-        except OCRError as e:
+            result = self._engine.ocr_image(
+                image_bytes,
+                language=language or self._language,
+            )
+        except OCRError as exc:
             logger.error(
                 "ocr_page_failed",
                 page=page_number,
-                error=str(e),
+                error=str(exc),
             )
             raise
 
         confidence = float(result.get("confidence", 0.0))
-
-        is_low_confidence = (
-            confidence < self._settings.ocr_confidence_threshold
-        )
+        is_low_confidence = confidence < self._settings.ocr_confidence_threshold
 
         logger.info(
             "ocr_page_complete",

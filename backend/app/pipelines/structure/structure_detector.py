@@ -1,17 +1,18 @@
 """
 Legal document structure detection.
 
-Designed for Indian court judgments and other legal PDFs where
-paragraph numbering may appear on a separate line:
+Supports Indian court judgments where numbered paragraphs may
+appear either:
 
     1.
-    This is the paragraph text...
+    This is the paragraph...
 
-or on the same line:
+or:
 
-    1. This is the paragraph text...
+    1. This is the paragraph...
 
-The detector also preserves paragraphs across page boundaries.
+The detector also supports paragraphs spanning multiple pages
+and remains compatible with the existing NyayaSetu pipeline.
 """
 
 from __future__ import annotations
@@ -73,27 +74,21 @@ class LegalStructure:
 
 class StructureDetector:
     """
-    Detects numbered paragraphs, sections and legal structure.
+    Detects legal paragraphs and sections.
 
-    The most important feature is support for paragraph numbers
-    appearing alone on a line.
+    Compatible with both:
+
+        StructureDetector(pages).detect()
+
+    and:
+
+        StructureDetector().detect(pages)
     """
 
-    # Paragraph number on its own line:
-    #
-    #   1.
-    #   12.
-    #   123.
-    #
     STANDALONE_PARAGRAPH_RE = re.compile(
         r"^\s*(\d{1,3})\.\s*$"
     )
 
-    # Paragraph number and text on the same line:
-    #
-    #   1. This is the paragraph.
-    #   12. The appellant contended...
-    #
     INLINE_PARAGRAPH_RE = re.compile(
         r"^\s*(\d{1,3})\.\s+(.+?)\s*$"
     )
@@ -103,7 +98,12 @@ class StructureDetector:
         re.IGNORECASE,
     )
 
-    # Common lines that should not become paragraphs.
+    FOOTNOTE_RE = re.compile(
+        r"^\s*\d+\s+(?:Also|SRA|Karl|Clause|As per|See|"
+        r"ibid|supra)\b",
+        re.IGNORECASE,
+    )
+
     IGNORE_LINE_PATTERNS = [
         re.compile(
             r"^\s*Digitally signed by\s*$",
@@ -123,27 +123,48 @@ class StructureDetector:
         ),
     ]
 
+    def __init__(
+        self,
+        pages: Iterable[Any] | None = None,
+    ) -> None:
+        self.pages = pages
+
     # --------------------------------------------------------
     # Public API
     # --------------------------------------------------------
 
     def detect(
         self,
-        pages: Iterable[Any],
+        pages: Iterable[Any] | None = None,
     ) -> LegalStructure:
         """
-        Detect structure from document pages.
+        Detect document structure.
 
-        `pages` may contain dictionaries or objects with:
-            page_number
-            raw_text
-            processed_text
+        Supports both:
+            detector = StructureDetector(pages)
+            detector.detect()
+
+        and:
+            detector = StructureDetector()
+            detector.detect(pages)
         """
 
-        normalized_pages = self._normalize_pages(pages)
+        if pages is not None:
+            self.pages = pages
 
-        paragraphs = self._extract_paragraph_candidates(
-            normalized_pages
+        if self.pages is None:
+            raise ValueError(
+                "StructureDetector.detect() requires pages."
+            )
+
+        normalized_pages = self._normalize_pages(
+            self.pages
+        )
+
+        paragraphs = (
+            self._extract_paragraph_candidates(
+                normalized_pages
+            )
         )
 
         self._assign_sections(
@@ -151,7 +172,9 @@ class StructureDetector:
             normalized_pages,
         )
 
-        sections = self._build_sections(paragraphs)
+        sections = self._build_sections(
+            paragraphs
+        )
 
         return LegalStructure(
             sections=sections,
@@ -159,7 +182,7 @@ class StructureDetector:
             section_source="inferred",
         )
 
-    # Compatibility alias.
+    # Existing compatibility name.
     detect_structure = detect
 
     # --------------------------------------------------------
@@ -170,9 +193,14 @@ class StructureDetector:
         self,
         pages: Iterable[Any],
     ) -> list[dict[str, Any]]:
+
         normalized: list[dict[str, Any]] = []
 
-        for index, page in enumerate(pages, start=1):
+        for index, page in enumerate(
+            pages,
+            start=1,
+        ):
+
             if isinstance(page, dict):
                 page_number = page.get(
                     "page_number",
@@ -193,14 +221,24 @@ class StructureDetector:
                 )
 
                 text = (
-                    getattr(page, "processed_text", None)
-                    or getattr(page, "raw_text", None)
+                    getattr(
+                        page,
+                        "processed_text",
+                        None,
+                    )
+                    or getattr(
+                        page,
+                        "raw_text",
+                        None,
+                    )
                     or ""
                 )
 
             normalized.append(
                 {
-                    "page_number": int(page_number),
+                    "page_number": int(
+                        page_number
+                    ),
                     "text": str(text),
                 }
             )
@@ -227,10 +265,6 @@ class StructureDetector:
         current_start_page: int | None = None
         current_end_page: int | None = None
         current_order_index = 0
-
-        # ----------------------------------------------------
-        # Helpers
-        # ----------------------------------------------------
 
         def flush_current() -> None:
             nonlocal current_number
@@ -277,8 +311,10 @@ class StructureDetector:
                     start_page=start_page,
                     end_page=end_page,
                     order_index=current_order_index,
-                    ocr_artifacts=self._detect_ocr_artifacts(
-                        content
+                    ocr_artifacts=(
+                        self._detect_ocr_artifacts(
+                            content
+                        )
                     ),
                 )
             )
@@ -288,48 +324,47 @@ class StructureDetector:
             current_start_page = None
             current_end_page = None
 
-        # ----------------------------------------------------
-        # Process every page
-        # ----------------------------------------------------
-
         for page in pages:
+
             page_number = page["page_number"]
             text = page["text"]
 
             lines = text.splitlines()
 
             for raw_line in lines:
+
                 line = raw_line.strip()
 
                 if not line:
-                    # Blank lines do NOT end the paragraph.
-                    # Legal paragraphs frequently contain
-                    # formatting whitespace.
                     continue
 
-                # Ignore PDF page footer.
+                # Ignore page footer.
                 if self.PAGE_NUMBER_RE.match(line):
                     continue
 
-                # Ignore digital-signature artifacts.
+                # Ignore signature artifacts.
                 if self._should_ignore_line(line):
                     continue
 
+                # Ignore obvious footnotes.
+                if self.FOOTNOTE_RE.match(line):
+                    continue
+
                 # ------------------------------------------------
-                # CASE 1:
-                #
-                # Number on a separate line:
+                # Paragraph number on separate line.
                 #
                 # 14.
-                # Aggrieved by the said decision...
+                # Text...
                 # ------------------------------------------------
 
                 standalone_match = (
-                    self.STANDALONE_PARAGRAPH_RE.match(line)
+                    self.STANDALONE_PARAGRAPH_RE.match(
+                        line
+                    )
                 )
 
                 if standalone_match:
-                    # Close previous paragraph.
+
                     flush_current()
 
                     current_number = int(
@@ -337,35 +372,34 @@ class StructureDetector:
                     )
 
                     current_lines = []
-
                     current_start_page = page_number
                     current_end_page = page_number
 
                     continue
 
                 # ------------------------------------------------
-                # CASE 2:
+                # Paragraph number and content on same line.
                 #
-                # Number and text on same line:
-                #
-                # 14. Aggrieved by the said decision...
+                # 14. Text...
                 # ------------------------------------------------
 
                 inline_match = (
-                    self.INLINE_PARAGRAPH_RE.match(line)
+                    self.INLINE_PARAGRAPH_RE.match(
+                        line
+                    )
                 )
 
                 if inline_match:
-                    # Close previous paragraph.
+
                     flush_current()
 
                     current_number = int(
                         inline_match.group(1)
                     )
 
-                    first_text = inline_match.group(2).strip()
-
-                    current_lines = [first_text]
+                    current_lines = [
+                        inline_match.group(2).strip()
+                    ]
 
                     current_start_page = page_number
                     current_end_page = page_number
@@ -373,32 +407,21 @@ class StructureDetector:
                     continue
 
                 # ------------------------------------------------
-                # CASE 3:
-                #
                 # Continuation line.
                 # ------------------------------------------------
 
                 if current_number is not None:
 
-                    # Preserve line content.
                     current_lines.append(line)
 
                     current_end_page = page_number
 
+                # Text before first numbered paragraph is
+                # intentionally ignored as legal paragraph
+                # content. It belongs to the document heading.
                 else:
-                    # Text before the first numbered paragraph.
-                    #
-                    # This includes:
-                    # - court name
-                    # - case title
-                    # - judgment heading
-                    # - parties
-                    #
-                    # We intentionally don't create a numbered
-                    # paragraph for this material.
                     continue
 
-        # Flush last paragraph.
         flush_current()
 
         return paragraphs
@@ -415,6 +438,7 @@ class StructureDetector:
         cleaned: list[str] = []
 
         for line in lines:
+
             line = re.sub(
                 r"\s+",
                 " ",
@@ -439,7 +463,6 @@ class StructureDetector:
 
         artifacts: list[str] = []
 
-        # Common OCR corruption patterns.
         if re.search(
             r"\b[a-zA-Z]\s+[a-zA-Z]\s+[a-zA-Z]\b",
             text,
@@ -469,6 +492,7 @@ class StructureDetector:
     ) -> bool:
 
         for pattern in self.IGNORE_LINE_PATTERNS:
+
             if pattern.match(line):
                 return True
 
@@ -487,12 +511,12 @@ class StructureDetector:
         if not paragraphs:
             return
 
-        # We use explicit legal section headings when present.
         headings = self._find_section_headings(
             pages
         )
 
         for paragraph in paragraphs:
+
             section_type, section_title = (
                 self._infer_section_for_paragraph(
                     paragraph,
@@ -512,7 +536,9 @@ class StructureDetector:
         pages: list[dict[str, Any]],
     ) -> list[tuple[int, int, str]]:
 
-        headings: list[tuple[int, int, str]] = []
+        headings: list[
+            tuple[int, int, str]
+        ] = []
 
         heading_keywords = {
             "facts": (
@@ -542,9 +568,14 @@ class StructureDetector:
         }
 
         for page in pages:
-            page_number = page["page_number"]
 
-            for raw_line in page["text"].splitlines():
+            page_number = page[
+                "page_number"
+            ]
+
+            for raw_line in page[
+                "text"
+            ].splitlines():
 
                 line = raw_line.strip()
 
@@ -566,7 +597,9 @@ class StructureDetector:
                 for section_type, candidates in (
                     heading_keywords.items()
                 ):
+
                     if normalized in candidates:
+
                         headings.append(
                             (
                                 page_number,
@@ -586,14 +619,19 @@ class StructureDetector:
     def _infer_section_for_paragraph(
         self,
         paragraph: LegalParagraph,
-        headings: list[tuple[int, int, str]],
+        headings: list[
+            tuple[int, int, str]
+        ],
     ) -> tuple[str, str]:
 
-        # Find the most recent heading occurring before
-        # the paragraph.
         applicable_heading = None
 
-        for heading_page, _, heading_title in headings:
+        for (
+            heading_page,
+            _,
+            heading_title,
+        ) in headings:
+
             if heading_page <= paragraph.start_page:
                 applicable_heading = (
                     heading_page,
@@ -603,6 +641,7 @@ class StructureDetector:
                 break
 
         if applicable_heading is not None:
+
             title = applicable_heading[1]
             normalized = title.upper()
 
@@ -614,7 +653,10 @@ class StructureDetector:
                     "CONTENTION",
                 )
             ):
-                return "arguments", title
+                return (
+                    "arguments",
+                    title,
+                )
 
             if any(
                 keyword in normalized
@@ -625,7 +667,10 @@ class StructureDetector:
                     "FINDING",
                 )
             ):
-                return "reasoning", title
+                return (
+                    "reasoning",
+                    title,
+                )
 
             if any(
                 keyword in normalized
@@ -636,7 +681,10 @@ class StructureDetector:
                     "RESULT",
                 )
             ):
-                return "decision", title
+                return (
+                    "decision",
+                    title,
+                )
 
             if any(
                 keyword in normalized
@@ -645,13 +693,13 @@ class StructureDetector:
                     "BACKGROUND",
                 )
             ):
-                return "facts", title
+                return (
+                    "facts",
+                    title,
+                )
 
         # ----------------------------------------------------
-        # No explicit heading.
-        #
-        # Use paragraph-number/content heuristics as a
-        # conservative fallback.
+        # Conservative paragraph-number heuristics.
         # ----------------------------------------------------
 
         number = paragraph.number
@@ -734,13 +782,22 @@ class StructureDetector:
 
         sections: list[LegalSection] = []
 
-        current_type = paragraphs[0].section_type
-        current_title = paragraphs[0].section_title
-        current_paragraphs: list[LegalParagraph] = []
+        current_type = paragraphs[
+            0
+        ].section_type
+
+        current_title = paragraphs[
+            0
+        ].section_title
+
+        current_paragraphs: list[
+            LegalParagraph
+        ] = []
 
         section_index = 0
 
         def flush_section() -> None:
+
             nonlocal current_paragraphs
             nonlocal section_index
 
@@ -779,14 +836,20 @@ class StructureDetector:
         for paragraph in paragraphs:
 
             if (
-                paragraph.section_type != current_type
+                paragraph.section_type
+                != current_type
                 or paragraph.section_title
                 != current_title
             ):
                 flush_section()
 
-                current_type = paragraph.section_type
-                current_title = paragraph.section_title
+                current_type = (
+                    paragraph.section_type
+                )
+
+                current_title = (
+                    paragraph.section_title
+                )
 
             current_paragraphs.append(
                 paragraph
@@ -798,27 +861,6 @@ class StructureDetector:
 
 
 # ============================================================
-# COMPATIBILITY ALIAS
-# ============================================================
-
-LegalStructureDetector = StructureDetector
-
-
-# ============================================================
-# CONVENIENCE FUNCTION
-# ============================================================
-
-def detect_legal_structure(
-    pages: Iterable[Any],
-) -> LegalStructure:
-    """
-    Convenience wrapper.
-    """
-
-    detector = StructureDetector()
-
-    return detector.detect(pages)
-# ============================================================
 # BACKWARD-COMPATIBILITY ALIASES
 # ============================================================
 
@@ -829,13 +871,16 @@ DetectedStructure = LegalStructure
 LegalStructureDetector = StructureDetector
 
 
+# ============================================================
+# CONVENIENCE FUNCTION
+# ============================================================
+
+
 def detect_legal_structure(
     pages: Iterable[Any],
 ) -> LegalStructure:
-    """
-    Convenience wrapper.
-    """
+    detector = StructureDetector(
+        pages
+    )
 
-    detector = StructureDetector()
-
-    return detector.detect(pages)
+    return detector.detect()

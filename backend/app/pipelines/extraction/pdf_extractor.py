@@ -1,16 +1,17 @@
 """PDF text extraction using PyMuPDF."""
 
-from typing import Optional
+from __future__ import annotations
+
 import fitz  # PyMuPDF
 
-from app.core.logging_config import get_logger
 from app.core.exceptions import DocumentProcessingError
+from app.core.logging_config import get_logger
 
 logger = get_logger("extraction")
 
 
 class PDFExtractor:
-    """Extract text from PDF files using PyMuPDF."""
+    """Extract text and rendered page images from PDF files using PyMuPDF."""
 
     @staticmethod
     def detect_pdf_type(pdf_path: str) -> tuple[str, dict]:
@@ -47,26 +48,22 @@ class PDFExtractor:
 
             if text_pages == total_pages:
                 return "text", info
-            elif image_pages == total_pages or (text_pages == 0 and image_pages > 0):
+            if image_pages == total_pages or (text_pages == 0 and image_pages > 0):
                 return "scanned", info
-            elif text_pages > 0 and image_pages > 0:
+            if text_pages > 0 and image_pages > 0:
                 return "hybrid", info
-            else:
-                return "unknown", info
+            return "unknown", info
 
-        except Exception as e:
-            logger.error("pdf_type_detection_failed", error=str(e), path=pdf_path)
+        except Exception as exc:
+            logger.error("pdf_type_detection_failed", error=str(exc), path=pdf_path)
             raise DocumentProcessingError(
-                f"Failed to detect PDF type: {str(e)}",
-                details={"path": pdf_path}
-            )
+                f"Failed to detect PDF type: {str(exc)}",
+                details={"path": pdf_path},
+            ) from exc
 
     @staticmethod
     def extract_text(pdf_path: str) -> list[dict]:
-        """
-        Extract text from each page of a text-based PDF.
-        Returns list of dicts with page_number, raw_text, has_images.
-        """
+        """Extract text from each page of a text-based PDF."""
         try:
             doc = fitz.open(pdf_path)
             pages = []
@@ -76,24 +73,64 @@ class PDFExtractor:
                 text = page.get_text("text")
                 images = page.get_images()
 
-                pages.append({
-                    "page_number": page_num + 1,
-                    "raw_text": text,
-                    "has_images": len(images) > 0,
-                    "extraction_method": "text",
-                    "char_count": len(text),
-                })
+                pages.append(
+                    {
+                        "page_number": page_num + 1,
+                        "raw_text": text,
+                        "has_images": len(images) > 0,
+                        "extraction_method": "text",
+                        "char_count": len(text),
+                    }
+                )
 
             doc.close()
             logger.info("text_extraction_complete", pages=len(pages), path=pdf_path)
             return pages
 
-        except Exception as e:
-            logger.error("text_extraction_failed", error=str(e), path=pdf_path)
+        except Exception as exc:
+            logger.error("text_extraction_failed", error=str(exc), path=pdf_path)
             raise DocumentProcessingError(
-                f"Failed to extract text from PDF: {str(e)}",
-                details={"path": pdf_path}
-            )
+                f"Failed to extract text from PDF: {str(exc)}",
+                details={"path": pdf_path},
+            ) from exc
+
+    @staticmethod
+    def inspect_pages_for_ocr(
+        pdf_path: str,
+        text_threshold: int = 50,
+    ) -> list[dict]:
+        """
+        Inspect every page once to determine which pages already have a usable
+        text layer and which require OCR.
+        """
+        try:
+            doc = fitz.open(pdf_path)
+            plan: list[dict] = []
+
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                text = page.get_text("text")
+                images = page.get_images()
+                has_usable_text = len(text.strip()) > text_threshold
+
+                plan.append(
+                    {
+                        "page_number": page_num + 1,
+                        "raw_text": text if has_usable_text else "",
+                        "has_images": len(images) > 0,
+                        "needs_ocr": not has_usable_text,
+                    }
+                )
+
+            doc.close()
+            return plan
+
+        except Exception as exc:
+            logger.error("pdf_page_inspection_failed", error=str(exc), path=pdf_path)
+            raise DocumentProcessingError(
+                f"Failed to inspect PDF pages: {str(exc)}",
+                details={"path": pdf_path},
+            ) from exc
 
     @staticmethod
     def get_page_count(pdf_path: str) -> int:
@@ -103,14 +140,18 @@ class PDFExtractor:
             count = len(doc)
             doc.close()
             return count
-        except Exception as e:
+        except Exception as exc:
             raise DocumentProcessingError(
-                f"Failed to read PDF: {str(e)}",
-                details={"path": pdf_path}
-            )
+                f"Failed to read PDF: {str(exc)}",
+                details={"path": pdf_path},
+            ) from exc
 
     @staticmethod
-    def extract_page_as_image(pdf_path: str, page_number: int, dpi: int = 300) -> bytes:
+    def extract_page_as_image(
+        pdf_path: str,
+        page_number: int,
+        dpi: int = 200,
+    ) -> bytes:
         """Extract a single page as a PNG image for OCR."""
         try:
             doc = fitz.open(pdf_path)
@@ -120,8 +161,33 @@ class PDFExtractor:
             img_bytes = pix.tobytes("png")
             doc.close()
             return img_bytes
-        except Exception as e:
+        except Exception as exc:
             raise DocumentProcessingError(
-                f"Failed to render page {page_number} as image: {str(e)}",
-                details={"path": pdf_path, "page": page_number}
-            )
+                f"Failed to render page {page_number} as image: {str(exc)}",
+                details={"path": pdf_path, "page": page_number},
+            ) from exc
+
+    @staticmethod
+    def render_pages_as_images(
+        pdf_path: str,
+        page_numbers: list[int],
+        dpi: int = 200,
+    ) -> dict[int, bytes]:
+        """Render multiple pages in a single PDF open call."""
+        try:
+            doc = fitz.open(pdf_path)
+            mat = fitz.Matrix(dpi / 72, dpi / 72)
+            rendered: dict[int, bytes] = {}
+
+            for page_number in page_numbers:
+                page = doc[page_number - 1]
+                pix = page.get_pixmap(matrix=mat)
+                rendered[page_number] = pix.tobytes("png")
+
+            doc.close()
+            return rendered
+        except Exception as exc:
+            raise DocumentProcessingError(
+                f"Failed to render PDF pages as images: {str(exc)}",
+                details={"path": pdf_path},
+            ) from exc
