@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import time
 from typing import Any
 from uuid import UUID
 
@@ -70,6 +71,7 @@ async def index_document(document_id: UUID) -> int:
     """Generate embeddings and build a FAISS index for one document."""
 
     document_id_str = str(document_id)
+    total_start = time.perf_counter()
 
     logger.info(
         "document_indexing_started",
@@ -110,6 +112,8 @@ async def index_document(document_id: UUID) -> int:
 
     texts = [chunk.content for chunk in chunks]
 
+    embed_start = time.perf_counter()
+
     embeddings = await asyncio.to_thread(
         embedding_model.encode,
         texts,
@@ -119,7 +123,13 @@ async def index_document(document_id: UUID) -> int:
         "document_embeddings_generated",
         document_id=document_id_str,
         chunks=len(chunks),
+        device=embedding_model.device,
+        model=embedding_model.settings.embedding_model,
         dimension=embeddings.shape[1],
+        elapsed_seconds=round(
+            time.perf_counter() - embed_start,
+            4,
+        ),
     )
 
     # ------------------------------------------------------------------
@@ -161,8 +171,20 @@ async def index_document(document_id: UUID) -> int:
         metadata,
     )
 
+    save_start = time.perf_counter()
+
     await asyncio.to_thread(
         vector_store.save
+    )
+
+    logger.info(
+        "document_index_saved",
+        document_id=document_id_str,
+        vectors=vector_store.index.ntotal,
+        elapsed_seconds=round(
+            time.perf_counter() - save_start,
+            4,
+        ),
     )
 
     # ------------------------------------------------------------------
@@ -189,6 +211,10 @@ async def index_document(document_id: UUID) -> int:
         document_id=document_id_str,
         chunks=len(chunks),
         vectors=vector_store.index.ntotal,
+        elapsed_seconds=round(
+            time.perf_counter() - total_start,
+            4,
+        ),
     )
 
     return len(chunks)
